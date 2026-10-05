@@ -192,12 +192,47 @@ pub fn headerConflict(generated: ?[]const u8, pinned: []const Header, configured
     return false;
 }
 
+/// The routing token of one Codex turn. `arena` owns its bytes until the turn ends.
+/// A changed URL or header set clears the token, so another host or credential never receives it.
+pub const CodexTurn = struct {
+    arena: std.mem.Allocator,
+    scope_digest: ?[32]u8 = null,
+    value_owned: ?[]const u8 = null,
+
+    /// Bind the turn to borrowed request data without keeping the URL or credentials.
+    pub fn bind(self: *CodexTurn, borrowed: Request) void {
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update(std.mem.asBytes(&borrowed.url.len));
+        hash.update(borrowed.url);
+        for (borrowed.headers) |h| {
+            hash.update(std.mem.asBytes(&h.name.len));
+            hash.update(h.name);
+            hash.update(std.mem.asBytes(&h.value.len));
+            hash.update(h.value);
+        }
+        const digest = hash.finalResult();
+        if (self.scope_digest) |scope| if (std.mem.eql(u8, &scope, &digest)) return;
+        self.scope_digest = digest;
+        self.value_owned = null;
+    }
+
+    /// Copy the first valid response token into `arena`. A later token cannot replace it.
+    /// Fail with `OutOfMemory` when the turn cannot own the bytes.
+    pub fn capture(self: *CodexTurn, borrowed: []const u8) error{OutOfMemory}!void {
+        std.debug.assert(self.scope_digest != null);
+        std.debug.assert(validHeaderValue(borrowed));
+        if (self.value_owned == null) self.value_owned = try self.arena.dupe(u8, borrowed);
+    }
+};
+
 /// The request one route sends. A transport only reads it, so a retry resends the same bytes.
 pub const Request = struct {
     url: []const u8 = "",
     headers: []const Header = &.{},
     /// The body in parts, sent in order. A long history stays in one part across requests.
     body: []const []const u8,
+    /// Borrow the routing state until the response closes. Null disables Codex routing.
+    codex_turn_borrow: ?*CodexTurn = null,
 };
 
 /// Build the headers one route sends, in order: the credential, the identity headers, the route headers, the session id.

@@ -60,9 +60,18 @@ pub const HttpTransport = struct {
         self.refreshCertificateClock();
 
         // The provider sends SSE, so request it. The transport owns Accept and User-Agent, so a route copy is dropped.
-        const extra = try arena.alloc(std.http.Header, request.headers.len + 1);
+        const turn_value = if (request.codex_turn_borrow) |turn| value: {
+            for (request.headers) |h| if (std.ascii.eqlIgnoreCase(h.name, "x-codex-turn-state")) return Error.InvalidHeaders;
+            turn.bind(request);
+            break :value turn.value_owned;
+        } else null;
+        const extra = try arena.alloc(std.http.Header, request.headers.len + 1 + @intFromBool(turn_value != null));
         extra[0] = .{ .name = "accept", .value = "text/event-stream" };
         var extra_len: usize = 1;
+        if (turn_value) |value| {
+            extra[extra_len] = .{ .name = "x-codex-turn-state", .value = value };
+            extra_len += 1;
+        }
         for (request.headers) |h| {
             if (std.ascii.eqlIgnoreCase(h.name, "accept") or std.ascii.eqlIgnoreCase(h.name, "user-agent")) continue;
             extra[extra_len] = .{ .name = h.name, .value = h.value };
@@ -86,7 +95,7 @@ pub const HttpTransport = struct {
         // Connect, send, and the head wait share the idle deadline, so a silent peer never holds the call.
         try hb.bounded(HttpBody.exchangeHead, .{ &self.client, uri, extra[0..extra_len], request.body, self.user_agent, info }, HttpBody.abandon);
         errdefer hb.abandon();
-        try readHeaders(hb.response.head, arena, info); // The reader below invalidates these slices.
+        try readHeaders(hb.response.head, arena, info, request.codex_turn_borrow); // The reader below invalidates these slices.
         if (hb.response.head.status != .ok) {
             const status: u16 = @intFromEnum(hb.response.head.status);
             info.status = status;
@@ -216,7 +225,7 @@ const HttpBody = struct {
 };
 
 /// Read the retry hints and the request id. The id is copied, because the body reader invalidates the head.
-fn readHeaders(head: std.http.Client.Response.Head, arena: Allocator, info: *transport.AttemptInfo) !void {
+fn readHeaders(head: std.http.Client.Response.Head, arena: Allocator, info: *transport.AttemptInfo, codex_turn_borrow: ?*route.CodexTurn) error{ OutOfMemory, MalformedResponse }!void {
     var it = head.iterateHeaders();
     while (it.next()) |h| {
         if (std.ascii.eqlIgnoreCase(h.name, "request-id") or std.ascii.eqlIgnoreCase(h.name, "x-request-id")) {
@@ -229,6 +238,10 @@ fn readHeaders(head: std.http.Client.Response.Head, arena: Allocator, info: *tra
             if (std.fmt.parseInt(u64, std.mem.trim(u8, h.value, " "), 10)) |secs| {
                 info.retry_after_ms = secs *| 1000;
             } else |_| {} // An HTTP-date form needs a clock, so the caller uses its own delay.
+        } else if (codex_turn_borrow != null and head.status == .ok and std.ascii.eqlIgnoreCase(h.name, "x-codex-turn-state")) {
+            const value = std.mem.trim(u8, h.value, " \t");
+            if (!route.validHeaderValue(value)) return error.MalformedResponse;
+            try codex_turn_borrow.?.capture(value);
         } else if (std.ascii.eqlIgnoreCase(h.name, "x-should-retry")) {
             if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, h.value, " "), "false")) info.no_retry = true;
         }
@@ -357,6 +370,10 @@ const Server = struct {
     user_agent: ?[]const u8 = null, // The last User-Agent value the client sent, stored in `user_agent_buf`.
     user_agent_buf: [64]u8 = undefined,
     user_agent_count: usize = 0,
+    turn_state: ?[]const u8 = null,
+    turn_received: ?[]const u8 = null,
+    turn_received_buf: [64]u8 = undefined,
+    turn_count: usize = 0,
 };
 
 /// Accept one connection and stream `body` with `status`. A test drives this on the run's executor.
@@ -376,18 +393,26 @@ fn serveOnceInner(s: *Server) !void {
     var server = std.http.Server.init(&reader.interface, &writer.interface);
     var request = try server.receiveHead();
     var it = request.iterateHeaders();
-    while (it.next()) |h| if (std.ascii.eqlIgnoreCase(h.name, "user-agent")) {
-        s.user_agent = s.user_agent_buf[0..h.value.len];
-        @memcpy(s.user_agent_buf[0..h.value.len], h.value);
-        s.user_agent_count += 1;
-    };
+    while (it.next()) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "user-agent")) {
+            s.user_agent = s.user_agent_buf[0..h.value.len];
+            @memcpy(s.user_agent_buf[0..h.value.len], h.value);
+            s.user_agent_count += 1;
+        } else if (std.ascii.eqlIgnoreCase(h.name, "x-codex-turn-state")) {
+            if (h.value.len > s.turn_received_buf.len) return error.TestHeaderTooLong;
+            s.turn_received = s.turn_received_buf[0..h.value.len];
+            @memcpy(s.turn_received_buf[0..h.value.len], h.value);
+            s.turn_count += 1;
+        }
+    }
     if (s.silent) {
         if (s.release) |r| r.wait(s.io) catch {};
         return;
     }
 
-    var header_storage: [3]std.http.Header = .{
+    var header_storage: [4]std.http.Header = .{
         .{ .name = "content-type", .value = "text/event-stream" },
+        undefined,
         undefined,
         undefined,
     };
@@ -398,6 +423,11 @@ fn serveOnceInner(s: *Server) !void {
     }
     if (s.request_id) |id| {
         header_storage[header_len] = .{ .name = "request-id", .value = id };
+        header_len += 1;
+    }
+
+    if (s.turn_state) |value| {
+        header_storage[header_len] = .{ .name = "X-Codex-Turn-State", .value = value };
         header_len += 1;
     }
 
@@ -426,6 +456,9 @@ const ClientOut = struct {
     status: ?u16 = null, // Copies of the attempt info, because its arena dies with the client task.
     request_id: std.ArrayList(u8) = .empty,
     error_body: std.ArrayList(u8) = .empty,
+    codex_turn_borrow: ?*route.CodexTurn = null,
+    key: []const u8 = "test-key",
+    path: []const u8 = "/messages",
 };
 
 fn clientTask(out: *ClientOut) void {
@@ -441,14 +474,14 @@ fn runClient(out: *ClientOut) !void {
     var arena = std.heap.ArenaAllocator.init(out.gpa);
     defer arena.deinit();
     var url_buf: [64]u8 = undefined;
-    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}/messages", .{out.port});
+    const url = try std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}{s}", .{ out.port, out.path });
     // A route that pins its own User-Agent must not produce a second header line.
     const headers = [_]route.Header{
-        .{ .name = "x-api-key", .value = "test-key" },
+        .{ .name = "x-api-key", .value = out.key },
         .{ .name = "User-Agent", .value = "pinned/9" },
     };
     var info: transport.AttemptInfo = .{};
-    const opened = http.transportFor().open(arena.allocator(), .{ .url = url, .headers = &headers, .body = &.{} }, &info);
+    const opened = http.transportFor().open(arena.allocator(), .{ .url = url, .headers = &headers, .body = &.{}, .codex_turn_borrow = out.codex_turn_borrow }, &info);
     out.status = info.status;
     if (info.request_id) |id| try out.request_id.appendSlice(out.gpa, id);
     if (info.body) |text| try out.error_body.appendSlice(out.gpa, text);
@@ -605,5 +638,56 @@ test "a 429 body distinguishes quota, rate limit, and unknown failures" {
         try testing.expectEqual(@as(?anyerror, case.expected), out.err);
         try testing.expectEqual(@as(?u16, 429), out.status);
         try testing.expectEqualStrings(case.body, out.error_body.items);
+    }
+}
+
+test "Codex routing keeps the first successful token across responses and isolates request scopes" {
+    const io = testing.io;
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var turn: route.CodexTurn = .{ .arena = arena.allocator() };
+    var fresh: route.CodexTurn = .{ .arena = arena.allocator() };
+    const address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", 0);
+    var listener = try address.listen(io, .{});
+    defer listener.deinit(io);
+    const Case = struct {
+        status: std.http.Status = .ok,
+        response_token: []const u8,
+        expected_sent: ?[]const u8 = null,
+        expected_kept: ?[]const u8,
+        key: []const u8 = "test-key",
+        path: []const u8 = "/messages",
+        new_turn: bool = false,
+    };
+    for ([_]Case{
+        .{ .status = .service_unavailable, .response_token = "error-route", .expected_kept = null },
+        .{ .response_token = "route-A", .expected_kept = "route-A" },
+        .{ .response_token = "route-B", .expected_sent = "route-A", .expected_kept = "route-A" },
+        .{ .status = .service_unavailable, .response_token = "error-route", .expected_sent = "route-A", .expected_kept = "route-A" },
+        .{ .response_token = "route-C", .key = "rotated-key", .expected_kept = "route-C" },
+        .{ .response_token = "route-D", .key = "rotated-key", .path = "/another-origin-path", .expected_kept = "route-D" },
+        .{ .response_token = "fresh-route", .new_turn = true, .expected_kept = "fresh-route" },
+    }) |case| {
+        const state = if (case.new_turn) &fresh else &turn;
+        var srv: Server = .{ .io = io, .listener = &listener, .body = if (case.status == .ok) canned_sse else "", .status = case.status, .turn_state = case.response_token };
+        var out: ClientOut = .{ .gpa = testing.allocator, .io = io, .port = listener.socket.address.getPort(), .codex_turn_borrow = state, .key = case.key, .path = case.path };
+        defer out.bytes.deinit(testing.allocator);
+        defer out.request_id.deinit(testing.allocator);
+        defer out.error_body.deinit(testing.allocator);
+        var server = try io.concurrent(serveOnce, .{&srv});
+        var client = try io.concurrent(clientTask, .{&out});
+        client.await(io);
+        server.await(io);
+        if (srv.err) |err| return err;
+        if (case.status == .ok) {
+            if (out.err) |err| return err;
+        } else try testing.expectEqual(@as(?anyerror, error.ServerError), out.err);
+        if (case.expected_sent) |value| {
+            try testing.expectEqualStrings(value, srv.turn_received.?);
+            try testing.expectEqual(@as(usize, 1), srv.turn_count);
+        } else try testing.expectEqual(@as(usize, 0), srv.turn_count);
+        if (case.expected_kept) |value| {
+            try testing.expectEqualStrings(value, state.value_owned.?);
+        } else try testing.expect(state.value_owned == null);
     }
 }

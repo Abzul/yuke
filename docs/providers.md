@@ -23,6 +23,18 @@ A built-in provider reads its key from a variable for each run. An empty variabl
 | `needs login` | Run `yuke login <provider>`. |
 | `needs route` | A field is missing or two fields conflict. Fix the entry. |
 
+## Codex turn routing
+
+On the `codex` Responses dialect, yuke keeps the first successful response's
+`x-codex-turn-state` token. It sends that token on later requests and retries of
+the same turn, including requests after a tool finishes. A new turn starts with
+no token. A changed request URL or header set also clears it, so a changed
+credential or a request hook cannot send the old token to another route.
+
+The transport owns this header. Do not pin it in `providers.json` or a
+`request.send` hook. The token stays in memory and does not enter the session
+store or the log. Compaction calls do not share the turn token.
+
 ## The file
 
 ```json

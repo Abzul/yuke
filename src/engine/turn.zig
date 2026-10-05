@@ -51,7 +51,7 @@ pub fn execute(engine: *Engine, slot: *RunSlot) void {
         rt.draft = null;
     };
 
-    var streamer: Streamer = .{ .engine = engine, .slot = slot, .session = rt };
+    var streamer: Streamer = .{ .engine = engine, .slot = slot, .session = rt, .codex_turn = .{ .arena = slot.arena.allocator() } };
     defer streamer.blocks.deinit(engine.deps.gpa);
 
     var boundary_state: std.heap.ArenaAllocator = .init(engine.deps.gpa);
@@ -154,7 +154,7 @@ fn streamRound(engine: *Engine, out: std.mem.Allocator, slot: *RunSlot, streamer
     defer if (built) |*held| held.request.deinit();
     // A compaction inside the build calls the provider, and its answer must outlive the build state.
     var diagnostics: ai.Diagnostics = .{ .arena = out };
-    const build = switch (slot.cancel.runChild(engine.deps.io, requestChild, .{ engine, arena, slot, &built, &diagnostics })) {
+    const build = switch (slot.cancel.runChild(engine.deps.io, requestChild, .{ engine, arena, streamer, &built, &diagnostics })) {
         .canceled, .aborted => return .canceled,
         .returned => |result| result,
     };
@@ -285,14 +285,15 @@ const Built = struct {
     cost: []const ai.model.PriceBand,
 };
 
-fn requestChild(engine: *Engine, arena: std.mem.Allocator, slot: *RunSlot, out: *?Built, diagnostics: *ai.Diagnostics) !void {
+fn requestChild(engine: *Engine, arena: std.mem.Allocator, streamer: *Streamer, out: *?Built, diagnostics: *ai.Diagnostics) !void {
     std.debug.assert(out.* == null);
-    try slot.cancel.check(engine.deps.io);
-    out.* = try roundRequest(engine, arena, slot, diagnostics);
+    try streamer.slot.cancel.check(engine.deps.io);
+    out.* = try roundRequest(engine, arena, streamer, diagnostics);
 }
 
 /// Build the request for one round. A retry re-sends these bytes, so the cached prefix still matches.
-fn roundRequest(engine: *Engine, arena: std.mem.Allocator, slot: *RunSlot, diagnostics: *ai.Diagnostics) !Built {
+fn roundRequest(engine: *Engine, arena: std.mem.Allocator, streamer: *Streamer, diagnostics: *ai.Diagnostics) !Built {
+    const slot = streamer.slot;
     const model = slot.config.model;
 
     // The catalog must resolve the model. An unresolved selector is an operating error, not a bug.
@@ -309,7 +310,8 @@ fn roundRequest(engine: *Engine, arena: std.mem.Allocator, slot: *RunSlot, diagn
         error.ContextHistoryTooLarge => try compactAndProject(engine, arena, slot, rt, held, diagnostics),
         else => return err,
     };
-    const request = try round_request.prepare(arena, engine, slot, held, projected);
+    var request = try round_request.prepare(arena, engine, slot, held, projected);
+    if (held.route.route.responses_dialect == .codex) request.transport_request.codex_turn_borrow = &streamer.codex_turn;
     return .{ .request = request, .cost = held.model.cost };
 }
 
@@ -542,6 +544,8 @@ const Title = struct {
 };
 
 const Streamer = struct {
+    /// The turn owns the routing state and borrows the run arena for its token across stream resets.
+    codex_turn: ai.route.CodexTurn,
     engine: *Engine,
     slot: *RunSlot,
     session: *Session,
@@ -1053,7 +1057,7 @@ const StreamerFixture = struct {
     }
 
     fn streamer(self: *StreamerFixture) Streamer {
-        return .{ .engine = &self.engine, .slot = self.slot, .session = self.session };
+        return .{ .engine = &self.engine, .slot = self.slot, .session = self.session, .codex_turn = .{ .arena = self.slot.arena.allocator() } };
     }
 };
 
